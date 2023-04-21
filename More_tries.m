@@ -1,0 +1,383 @@
+clear
+clc
+
+N = 9;
+
+% I created the code so that when having U = 0 we exploit the fact that the
+% system becomes spin independent (There's no interaction between spin up
+% and spin down speceies in our MPS description), and hence, the
+% computations become cheaper.
+U = 0;
+epsd = -U/2; 
+Nkeep = 250; 
+dt = 0.1;
+tmax = 25;
+Tstep = 0:dt:tmax;
+
+% Initialize Local space of "spinless fermions". The fact that we consider
+% them spinless is what doubles the size of our MPS
+[F,Z,I] = getLocalSpace('Fermion');
+
+    Nsite = 2*(N+1);
+
+fprintf("\n 2. tDMRG for single-impurity Anderson model (SIAM)\n" + ...
+    "Martí Cladera Rosselló \n");
+fprintf(['\n Parameters: U = ',sprintf('%i',U), ...
+    ', epsd = ',sprintf('%.2g',epsd),...
+    ', Effective Nsite = ',sprintf('%i',Nsite),'\n\n']);
+
+
+%%
+ozin = linspace(-1,1,N+1);
+[ff,gg,estarimp,vstarimp] = doLinDisc(ozin,N);
+estar = estarimp(2:end);
+vstar = vstarimp(2:end);
+ff_sp = [flipud(ff);0;ff];
+gg_sp = [flipud(gg);gg];
+estarimp_sp = [fliplr(estarimp) estarimp];
+vstarimp_sp = [fliplr(vstarimp) vstarimp];
+
+
+    % Construction of H_star
+    Hstar = zeros(Nsite,Nsite);
+    Hstar = diag(estarimp_sp);
+    Hstar(N+1,:) = [fliplr(vstarimp) zeros(1,Nsite-length(vstarimp))];
+    Hstar(:,N+1) = [fliplr(vstarimp)'; zeros(Nsite-length(vstarimp),1)];
+    Hstar(N+2,:) = [zeros(1,Nsite-length(vstarimp)) vstarimp];
+    Hstar(:,N+2) = [zeros(Nsite-length(vstarimp),1); (vstarimp)'];
+    
+    % Construction of H_chain 
+    Hchain = zeros(Nsite,Nsite);
+    Hchain = diag(ff_sp,1);
+    Hchain = Hchain + Hchain';
+    Hchain = Hchain + diag(gg_sp);
+
+
+%% Ground State search - DMRG
+
+% Let us construct the MPO, notice how the Hchain has the form of 
+% SUM_{nn}(t_{ij}*C^*_{i}*C_{j} + h.c) HOWEVER we don't have to take 
+% into account the spin degree of freedom due to the particle-hole symmetry
+% so the Hilbert space is two dimensional (empty or occupied).
+% Notice how we number of bath sites --> 2N = 2(N+1) counting the impurity.
+% Remark 1: We'll be following the MPS description in Ref.[1].
+% Remark 2: When U = 0 we can neglect the differenciation between 
+% spin-up and spin-down sites, since the Hamiltonian becomes spin
+% independent. Nevertheless, we have to take into account in the
+% degeneracy.
+%{
+u: spin-up
+d: spin-down
+u-I: spin-up Impurity
+d-I: spin-down Impurity
+Ref[1]
+ 
+         BATH-u                                           BATH-d
+    --------^-------------                       -----------^-----------
+Site:  N+1        N            1           1            N        N+1
+
+    ---(u)---*---(u)---...---(u-I)---*---(d-I)---...---(d)---*---(d)---
+        |         |            |           |            |         |
+        |         |            |           |            |         |
+Comp    
+Site:   1         2           N+1         N+2         2(N+1)    2(N+2)
+
+%}
+
+
+    % MPO for Hff: START %
+    % As stated in the paper by Daniel Bauernfeind et.al., we'll be using a
+    % local Hilbert of dimension 2 (empty |0> or occupied |1>)
+    % Here we take into account the system for U~=0, where we cannot treat 
+    % the system as spinless with degeneracy 2.
+sp = [0,1;0,0];  % sigma+
+sm = [0,0;1,0];  % sigma-
+ns = [0,0;0,1];  % number op
+id = [1,0;0,1];  % identity
+
+Wc = cell(2*N+2,1);
+Wc{1} = zeros(1,2,4,2);
+Wc{1}(1,:,1,:) = gg(1) * ns;
+Wc{1}(1,:,2,:) = ff_sp(1) * sm;
+Wc{1}(1,:,3,:) = ff_sp(1) * sp;
+Wc{1}(1,:,4,:) = id;
+gg_sp(6) = epsd;
+gg_sp(7) = epsd;
+for j = 2:(2*N+1)
+    Wc{j} = zeros(4,2,4,2);
+    Wc{j}(1,:,1,:) = id;
+    Wc{j}(2,:,1,:) = sp;
+    Wc{j}(3,:,1,:) = sm;
+    Wc{j}(4,:,1,:) = gg_sp(j) * ns;
+    Wc{j}(4,:,2,:) = ff_sp(j) * sm;
+    Wc{j}(4,:,3,:) = ff_sp(j) * sp;
+    Wc{j}(4,:,4,:) = id;
+end
+Wc{N+1}(4,:,2,:) = U*ns;
+Wc{N+1}(4,:,3,:) = zeros(2,2);
+Wc{N+2}(2,:,1,:) = ns;
+Wc{N+2}(3,:,1,:) = zeros(2,2);
+Wc{2*N+2} = zeros(4,2,1,2);
+Wc{2*N+2}(1,:,1,:) = id;
+Wc{2*N+2}(2,:,1,:) = sp;
+Wc{2*N+2}(3,:,1,:) = sm;
+
+
+MPS = cell(Nsite,1);
+MPS{1} = rand(1,2,Nkeep);
+MPS(2:Nsite-1) = {rand(Nkeep,2,Nkeep)};
+MPS{Nsite} = rand(Nkeep,2,1);
+
+
+if U == 0
+    [M0,E0,~] = DMRG_2site(Wc,MPS,sqrt(2),Nkeep,100,'Econv',1e-12);
+    fprintf(['\n Energy Ground State (U = 0) = ',sprintf('%.7g',E0),'\n'])
+else
+    [M0ref,E0ref,~] = DMRG_2site(Wc,MPS,sqrt(2),Nkeep,100,'Econv',1e-14);
+    [M0,E0,~] = DMRG_2site(Wc,MPS,sqrt(2),Nkeep/2,100,'Econv',1e-12);
+    fprintf(['\n Reference Energy Ground State (U = 1) = ', ...
+        sprintf('%.7g',E0ref),'\n'])
+end
+
+%% Creating the initial state
+
+% The initial state is applying the creation operator on the impurity site
+% of the ground state.
+
+% Let us construct the intitial MPO applying C^dad_I only to the first 
+% site corresponding to the impurity, and the corresponding Z to take into
+% account the fermionic signs:
+
+Fdag = squeeze(F)';
+
+    if U ~= 0
+        Mref = M0;
+        Mref{N+1} = contract(Fdag,2,2,M0ref{N+1},3,2,[2 1 3]);
+        Mref{N+2} = contract(Z*Fdag,2,2,M0ref{N+2},3,2,[2 1 3]);
+    end
+
+    M = M0;
+    M{N+1} = contract(Fdag,2,2,M0{N+1},3,2,[2 1 3]);
+    M{N+2} = contract(Z*Fdag,2,2,M0{N+2},3,2,[2 1 3]);
+
+    %{
+    % Reference
+    Mref{N+1} = contract(Fdag,2,2,M0ref{N+1},3,2,[2 1 3]);
+    Mref{N+2} = contract(Fdag,2,2,M0ref{N+2},3,2,[2 1 3]);
+    for i=(1:N)
+        Mref{i} = contract(Z,2,2,M0ref{i},3,2,[2 1 3]);
+    end
+    for i=(N+3:length(M0ref))
+        Mref{i} = contract(Z,2,2,M0ref{i},3,2,[2 1 3]);
+    end
+
+    % Less precision
+    M{N+1} = contract(Fdag,2,2,M0{N+1},3,2,[2 1 3]);
+    M{N+2} = contract(Fdag,2,2,M0{N+2},3,2,[2 1 3]);
+    for i=(1:N)
+        M{i} = contract(Z,2,2,M0{i},3,2,[2 1 3]);
+    end
+    for i=(N+3:length(M0))
+        M{i} = contract(Z,2,2,M0{i},3,2,[2 1 3]);
+    end
+    %}
+
+
+
+%% Creating the two-site Hamiltonians
+
+% Construct the Hamiltonian as two site operators for Chain geometry
+Hc = cell(Nsite-1,1);
+
+n_I = [0 0; 0 1]; % Number operator 1 if occupied (|1><1|) 0 otherwise.
+
+% Show calculation on why there should NOT be a minus sign!
+
+
+    Tensor_N1 =reshape(epsd*(kron(n_I,eye(2)) + kron(eye(2), ...
+        n_I)),[2 2 2 2]);
+
+    for i =(1:length(ff_sp))
+        Hc{i} =  ff_sp(i)'*contract(F,3,2,permute(conj(F),[3 2 1]),3,2);
+        Hc{i} = Hc{i} + ff_sp(i)*contract(permute(conj(F), ...
+            [3 2 1]),3,2,F,3,2);
+    end
+    % Now we take into account U and epsd for the impurity.
+    % Pictures with schemes!!!!!
+
+    % First the site that acts on the first spin up bath and spin up imp
+    Hc{N} = Hc{N} + permute(reshape(epsd*kron(eye(2), ...
+        n_I),[2 2 2 2]),[1 3 2 4]);
+
+    % Now actiong on both impurities (spin up-down)
+    Hc{N+1} = Hc{N+1} + permute(reshape(U*kron(n_I,n_I) ...
+        ,[2 2 2 2]),[1 3 2 4]);
+    Hc{N+1} = Hc{N+1} + permute(Tensor_N1,[1 3 2 4]);
+
+    % Now acting on the spin-up imp and first spin-up bath site
+    Hc{N+2} = Hc{N+2} + permute(reshape(epsd*kron(n_I,eye(2)), ...
+        [2 2 2 2]),[1 3 2 4]);
+
+%{
+
+%}
+
+%% Call time-evolution functions
+
+if U == 0
+    [Mf,Mr,EE,~,Green] = tDMRG_chain(M,Hc,Nkeep,dt/2,tmax/2);
+else
+    [Mfref,Mrref,EEref,~,Greenref] = tDMRG_chain(Mref,Hc,Nkeep,dt/4,tmax/2);
+    [Mf,Mr,EE,~,Green] = tDMRG_chain(M,Hc,Nkeep/10,dt/2,tmax/2);
+end
+
+
+
+%% Green function calculation and plots + Entropy plots
+
+if U == 0
+    for iT = (1:length(Tstep)-1)
+        Green(iT) = Green(iT)*exp(1i*dt*E0*iT);
+    end
+    Green = [1;Green];
+else
+    Greenref = Greenref(2:2:end);
+    for iT = (1:length(Tstep)-1)
+        Greenref(iT) = Greenref(iT)*exp(1i*dt*E0*iT);
+        Green(iT) = Green(iT)*exp(1i*dt*E0*iT);        
+    end
+    Greenref = [1;Greenref];
+    Green = [1;Green];
+end
+
+%% Exact greater Green's function
+
+if U == 0
+       % Chain Geometry
+    M = canonForm(M,Nsite,'-k');
+    
+    Tstep = 0:dt:tmax;
+    [U1,E1] = eig((Hchain+Hchain')/2);
+    Ud = U1';
+    Gexact = zeros(length(Tstep),1);
+    Ed = diag(E1);%*2;  
+    Nmk = zeros(Nsite,1);  % N_k
+    Ak2 = zeros(Nsite,1);  % abs(a_k)^2
+    Cop = cell(Nsite,1);  % Creation MPOs.
+    Aop = cell(Nsite,1);  % Annihilation MPOs.
+    Fan = squeeze(F);
+    Fdag = squeeze(F)';
+    Z = squeeze(Z);
+
+    % We compute the number of particles per site in the non-interacting
+    % hamiltonian eigenbasis
+    for itk = 1:(Nsite)
+
+        % Creation operator MPO.
+        Cop{1} = zeros(1,2,2,2);
+        Cop{1}(1,:,1,:) = Ud(itk,1)*Fdag;
+        Cop{1}(1,:,2,:) = eye(2);
+        for itj = 2:(Nsite-1)
+            Cop{itj} = zeros(2,2,2,2);
+            Cop{itj}(1,:,1,:) = Z;
+            Cop{itj}(2,:,1,:) = Ud(itk,itj)*Fdag;
+            Cop{itj}(2,:,2,:) = eye(2);
+        end
+        Cop{Nsite} = zeros(2,2,1,2);
+        Cop{Nsite}(1,:,1,:) = Z;
+        Cop{Nsite}(2,:,1,:) = Ud(itk,Nsite)*Fdag;
+
+        % Annhilation operator MPO.
+        Aop{1} = zeros(1,2,2,2);
+        Aop{1}(1,:,1,:) = U1(1,itk)*Fan;
+        Aop{1}(1,:,2,:) = eye(2);
+        for iti = 2:(Nsite-1)
+            Aop{iti} = zeros(2,2,2,2);
+            Aop{iti}(1,:,1,:) = Z;
+            Aop{iti}(2,:,1,:) = U1(iti,itk)*Fan;
+            Aop{iti}(2,:,2,:) = eye(2);
+        end
+        Aop{Nsite} = zeros(2,2,1,2);
+        Aop{Nsite}(1,:,1,:) = Z;
+        Aop{Nsite}(2,:,1,:) = U1(Nsite,itk)*Fan;
+
+        % Apply the number operator to the initial state M.
+        NM = contract(Aop{1},4,4,M{1},3,2);
+        NM = contract(Cop{1},4,4,NM,5,2);
+        NM = contract(conj(M{1}),3,2,NM,7,2);
+        NM = permute(NM,[2,4,6,8,1,3,5,7]);
+        for j = 2:(Nsite)
+            NM = contract(NM,4,4,M{j},3,1);
+            NM = contract(Aop{j},4,[1,4],NM,5,[3,4]);
+            NM = contract(Cop{j},4,[1,4],NM,5,[4,1]);
+            NM = contract(conj(M{j}),3,[1,2],NM,5,[4,1]);
+        end
+        Nmk(itk) = NM;%*2;
+        %Ak2(itk) = abs(Ud(itk,1)*U1(1,itk));
+        Ak2(itk) = abs(Ud(1,itk)*U1(itk,1));
+    end
+    sum(Nmk) % Total number of particles
+    U1
+    for itT = 1:numel(Tstep)
+        Gexact(itT) = sum(Ak2.*exp(-1i*((Ed.*Nmk))*Tstep(itT)));
+    end
+end
+%% Plots
+
+if U == 0
+    figure
+    plot(Tstep,real(Green))
+    grid on
+    figure
+    set(gcf,'units','points');
+    set(gcf,'position',[0 0 375 410]);
+    set(gcf,'paperunits', 'points');
+    set(gcf,'papersize', [975 310]);
+    set(gcf,'paperpositionmode', 'manual');
+    set(gcf,'paperposition', [0 0 375 310]);
+    set(gca,'units','points');
+    imagesc((1:Nsite),Tstep,EE);
+    xlabel('site $\ell$','Interpreter','latex','fontsize',18);
+    ylabel('time $t$','Interpreter','latex','fontsize',18);
+    colormap(turbo)
+    colorbar('eastoutside');
+    set(gca,'innerposition',[70,50,220,310]);
+    set(gca,'FontSize',18);
+    title('Entanglement Entropy - Chain','interpreter','latex');
+    figure
+    plot(xt,real(Gexact))
+    grid on
+    figure
+    semilogy(xt,abs(real(Green)-real(Gexact)))
+    grid on
+else
+    figure
+    plot(Tstep,real(Greenref))
+    grid on
+    figure
+    plot(Tstep,real(Green))
+    grid on
+    figure
+    set(gcf,'units','points');
+    set(gcf,'position',[0 0 375 410]);
+    set(gcf,'paperunits', 'points');
+    set(gcf,'papersize', [975 310]);
+    set(gcf,'paperpositionmode', 'manual');
+    set(gcf,'paperposition', [0 0 375 310]);
+    set(gca,'units','points');
+    imagesc((1:Nsite),Tstep,EEref);
+    xlabel('site $\ell$','Interpreter','latex','fontsize',18);
+    ylabel('time $t$','Interpreter','latex','fontsize',18);
+    colormap(turbo)
+    colorbar('eastoutside');
+    set(gca,'innerposition',[70,50,220,310]);
+    set(gca,'FontSize',18);
+    title('Entanglement Entropy','interpreter','latex');
+    figure
+    semilogy(Tstep,abs(real(Greenref)-real(Green)))
+    grid on
+end
+
+%%
+
+
